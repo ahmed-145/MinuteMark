@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { api } from "@/lib/api";
 
@@ -15,6 +15,14 @@ type GradingMode = "answer_key" | "rubric" | "course_material";
 
 export default function CreateExamPage() {
   const router = useRouter();
+
+  useEffect(() => {
+    const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
+    if (!token) {
+      router.push("/login");
+    }
+  }, [router]);
+
   const [title, setTitle] = useState("");
   const [subject, setSubject] = useState("");
   const [gradingMode, setGradingMode] = useState<GradingMode>("answer_key");
@@ -81,7 +89,7 @@ export default function CreateExamPage() {
   return (
     <div className="max-w-3xl mx-auto px-4 sm:px-6 py-12">
       <div className="mb-8">
-        <h1 className="page-header">Create Exam</h1>
+        <h1 className="page-header">Create MinuteMark Exam</h1>
         <p className="page-sub">Set up your exam and grading criteria — students submit via shareable link.</p>
       </div>
 

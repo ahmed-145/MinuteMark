@@ -161,15 +161,25 @@ async def _call_groq(system_prompt: str, user_message: str) -> dict:
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
     }
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        return json.loads(content)
+
+    import asyncio
+    for attempt in range(3):  # 2 retries
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            if resp.status_code == 429:
+                wait_time = (attempt + 1) * 10
+                print(f"DEBUG: Groq Rate Limit (429). Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+                continue
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            return json.loads(content)
+    raise RuntimeError("Groq rate limit — retry later")
+
 
 
 async def _call_gemini(system_prompt: str, user_message: str) -> dict:
@@ -202,3 +212,56 @@ async def _call_gemini(system_prompt: str, user_message: str) -> dict:
             content = resp.json()["choices"][0]["message"]["content"]
             return json.loads(content)
     raise RuntimeError("Gemini Flash rate limit — retry later")
+
+
+async def detect_exam_boundaries(pages_text: list[str]) -> list[list[int]]:
+    """
+    Analyzes a list of pages and groups them by student.
+    Returns a list of lists, e.g. [[0, 1], [2], [3, 4]] where numbers are page indices.
+    """
+    if not pages_text:
+        return []
+
+    prompt = """You are an expert document analyzer. I have a bulk scan of multiple student exams in one PDF.
+Your job is to identify the START of each new student's exam.
+Usually, the first page of an exam has a "Name", "Student ID", or a title.
+
+Pages (first 500 chars of each):
+{pages_summary}
+
+Respond ONLY with a JSON object in this format:
+{{
+  "groups": [[0, 1], [2], [3, 4]]
+}}
+Where each sub-list contains the page indices (0-indexed) that belong to ONE student.
+Ensure EVERY page index from 0 to {max_idx} is included exactly once in the groups.
+"""
+    pages_summary = "\n".join([f"Page {i}: {p[:500]}" for i, p in enumerate(pages_text)])
+
+    formatted_prompt = prompt.format(pages_summary=pages_summary, max_idx=len(pages_text)-1)
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {settings.groq_api_key}"},
+                json={
+                    "model": "llama-3.3-70b-versatile",
+                    "messages": [
+                        {"role": "system", "content": "You are a precise JSON generator."},
+                        {"role": "user", "content": formatted_prompt}
+                    ],
+                    "response_format": {"type": "json_object"}
+                }
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = json.loads(data["choices"][0]["message"]["content"])
+            return content.get("groups", [[i] for i in range(len(pages_text))])
+    except Exception:
+        # Fallback: Treat each page as a separate student if AI fails
+        return [[i] for i in range(len(pages_text))]
+    except Exception:
+        # Fallback: Treat each page as a separate student if AI fails
+        return [[i] for i in range(len(pages_text))]
+

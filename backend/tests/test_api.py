@@ -28,12 +28,20 @@ def setup_db():
 
 client = TestClient(app)
 
+def get_auth_token(email="test@example.com", password="password"):
+    # Register
+    client.post("/auth/register", json={"email": email, "password": password})
+    # Login
+    response = client.post("/auth/login", data={"username": email, "password": password})
+    return response.json()["access_token"]
+
 def test_health():
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 def test_create_exam():
+    token = get_auth_token()
     exam_data = {
         "title": "Math 101",
         "subject": "Mathematics",
@@ -48,7 +56,7 @@ def test_create_exam():
             }
         ]
     }
-    response = client.post("/exams", json=exam_data)
+    response = client.post("/exams", json=exam_data, headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 201
     data = response.json()
     assert data["title"] == "Math 101"
@@ -76,6 +84,7 @@ def test_submit_exam(mock_grade, setup_db):
         ]
     }
     
+    # Submitting an exam is public
     response = client.post(f"/exams/{exam_id}/submit", json=submission_data)
     assert response.status_code == 201
     data = response.json()
@@ -85,10 +94,20 @@ def test_submit_exam(mock_grade, setup_db):
     assert data["answers"][0]["ai_score"] == 10.0
 
 def test_list_submissions():
-    # Assuming the previous test created a submission
-    # But pytest runs tests in isolation if not careful. 
-    # Let's create one within this test for certainty.
     exam_id, q_id = test_create_exam()
+    token = get_auth_token("list@example.com", "password") # New user for this test
+    # Re-create exam for this specific user so they own it
+    exam_data = {
+        "title": "User Exam",
+        "subject": "Math",
+        "total_marks": 10,
+        "grading_mode": "answer_key",
+        "questions": [{"question_text": "Q", "max_marks": 10, "answer_key": "A"}]
+    }
+    exam_resp = client.post("/exams", json=exam_data, headers={"Authorization": f"Bearer {token}"})
+    exam_id = exam_resp.json()["id"]
+    q_id = exam_resp.json()["questions"][0]["id"]
+
     submission_data = {
         "student_name": "Jane Doe",
         "answers": [{"question_id": q_id, "answer_text": "4"}]
@@ -97,14 +116,26 @@ def test_list_submissions():
         mock_grade.return_value = {"score": 10.0, "feedback": "OK", "confidence": 1.0}
         client.post(f"/exams/{exam_id}/submit", json=submission_data)
     
-    response = client.get(f"/exams/{exam_id}/submissions")
+    response = client.get(f"/exams/{exam_id}/submissions", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     data = response.json()
     assert len(data) >= 1
     assert data[0]["student_name"] == "Jane Doe"
 
 def test_override_score():
-    exam_id, q_id = test_create_exam()
+    token = get_auth_token("override@example.com", "password")
+    # Create exam
+    exam_data = {
+        "title": "Override Test",
+        "subject": "S",
+        "total_marks": 10,
+        "grading_mode": "answer_key",
+        "questions": [{"question_text": "Q", "max_marks": 10, "answer_key": "K"}]
+    }
+    exam_resp = client.post("/exams", json=exam_data, headers={"Authorization": f"Bearer {token}"})
+    exam_id = exam_resp.json()["id"]
+    q_id = exam_resp.json()["questions"][0]["id"]
+
     submission_data = {
         "student_name": "Bob",
         "answers": [{"question_id": q_id, "answer_text": "Wrong"}]
@@ -116,17 +147,29 @@ def test_override_score():
     
     # Override to 5
     override_data = {"instructor_score": 5.0}
-    response = client.patch(f"/answers/{answer_id}/override", json=override_data)
+    response = client.patch(f"/answers/{answer_id}/override", json=override_data, headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     assert response.json()["final_score"] == 5.0
     
     # Verify submission total score updated
     sub_id = resp.json()["id"]
-    sub_resp = client.get(f"/submissions/{sub_id}")
+    sub_resp = client.get(f"/submissions/{sub_id}", headers={"Authorization": f"Bearer {token}"})
     assert sub_resp.json()["total_score"] == 5.0
 
 def test_get_analytics():
-    exam_id, q_id = test_create_exam()
+    token = get_auth_token("analytics@example.com", "password")
+    # Create exam
+    exam_data = {
+        "title": "Analytics Test",
+        "subject": "S",
+        "total_marks": 10,
+        "grading_mode": "answer_key",
+        "questions": [{"question_text": "Q", "max_marks": 10, "answer_key": "K"}]
+    }
+    exam_resp = client.post("/exams", json=exam_data, headers={"Authorization": f"Bearer {token}"})
+    exam_id = exam_resp.json()["id"]
+    q_id = exam_resp.json()["questions"][0]["id"]
+
     # Create a submission
     submission_data = {
         "student_name": "Alice",
@@ -136,7 +179,7 @@ def test_get_analytics():
         mock_grade.return_value = {"score": 8.0, "feedback": "Good", "confidence": 1.0}
         client.post(f"/exams/{exam_id}/submit", json=submission_data)
     
-    response = client.get(f"/exams/{exam_id}/analytics")
+    response = client.get(f"/exams/{exam_id}/analytics", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     data = response.json()
     assert data["total_submissions"] >= 1

@@ -21,19 +21,23 @@ def extract_text_from_image(path: str) -> str:
         raise RuntimeError("pytesseract not installed. Run: pip install pytesseract Pillow && sudo apt install tesseract-ocr")
 
 
-def extract_text_from_pdf(path: str) -> str:
-    """Extract text from a PDF using pdfplumber."""
+def extract_text_from_pdf_pages(path: str) -> list[str]:
+    """Extract text from a PDF using pdfplumber, returning a list of strings (one per page)."""
     try:
         import pdfplumber
         pages = []
         with pdfplumber.open(path) as pdf:
             for page in pdf.pages:
                 t = page.extract_text()
-                if t:
-                    pages.append(t)
-        return "\n".join(pages).strip()
+                pages.append(t or "")
+        return pages
     except ImportError:
         raise RuntimeError("pdfplumber not installed. Run: pip install pdfplumber")
+
+
+def extract_text_from_pdf(path: str) -> str:
+    """Extract text from a PDF as a single block of text."""
+    return "\n".join(extract_text_from_pdf_pages(path)).strip()
 
 
 def extract_text(path: str) -> str:
@@ -51,6 +55,16 @@ def extract_text(path: str) -> str:
         return extract_text_from_image(path)
     else:
         raise ValueError(f"Unsupported file type: {ext}. Supported: PDF, TXT, JPG, PNG, WEBP, BMP, TIFF")
+
+
+def extract_text_pages(path: str) -> list[str]:
+    """
+    Extract text page by page if supported (PDF), otherwise return as a single page list.
+    """
+    ext = Path(path).suffix.lower()
+    if ext == ".pdf":
+        return extract_text_from_pdf_pages(path)
+    return [extract_text(path)]
 
 
 def save_upload(contents: bytes, filename: str) -> str:

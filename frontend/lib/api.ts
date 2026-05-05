@@ -1,15 +1,39 @@
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
-async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const isFormData = options?.body instanceof FormData;
-  const res = await fetch(`${API_URL}${path}`, {
-    headers: isFormData ? { ...options?.headers } : { "Content-Type": "application/json", ...options?.headers },
-    ...options,
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`API error ${res.status}: ${text}`);
+const getAuthToken = () => {
+  if (typeof window !== "undefined") {
+    return localStorage.getItem("token");
   }
+  return null;
+};
+
+async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
+  const token = getAuthToken();
+  const isFormData = options?.body instanceof FormData;
+  
+  const headers: Record<string, string> = {
+    ...(!isFormData && { "Content-Type": "application/json" }),
+    ...(token && { Authorization: `Bearer ${token}` }),
+    ...(options?.headers as Record<string, string>),
+  };
+
+  const res = await fetch(`${API_URL}${path}`, {
+    ...options,
+    headers,
+  });
+
+  if (res.status === 401 && typeof window !== "undefined") {
+    localStorage.removeItem("token");
+    if (!window.location.pathname.includes("/login") && !window.location.pathname.includes("/register")) {
+      window.location.href = "/login";
+    }
+  }
+
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "An error occurred" }));
+    throw new Error(error.detail || "Request failed");
+  }
+
   return res.json();
 }
 
@@ -120,9 +144,43 @@ export interface ClassAnalytics {
   question_breakdown: QuestionAnalytics[];
 }
 
+export interface Token {
+  access_token: string;
+  token_type: string;
+}
+
+export interface User {
+  id: string;
+  email: string;
+}
+
 // ── API functions ──────────────────────────────────────────────────────────────
 
 export const api = {
+  register: (body: unknown) =>
+    apiFetch<User>("/auth/register", { method: "POST", body: JSON.stringify(body) }),
+
+  login: async (email: string, pass: string) => {
+    const formData = new FormData();
+    formData.append("username", email);
+    formData.append("password", pass);
+    const data = await apiFetch<Token>("/auth/login", { 
+      method: "POST", 
+      body: formData 
+    });
+    if (typeof window !== "undefined") {
+      localStorage.setItem("token", data.access_token);
+    }
+    return data;
+  },
+
+  logout: () => {
+    if (typeof window !== "undefined") {
+      localStorage.removeItem("token");
+      window.location.href = "/login";
+    }
+  },
+
   createExam: (body: unknown) =>
     apiFetch<Exam>("/exams", { method: "POST", body: JSON.stringify(body) }),
 
@@ -138,10 +196,19 @@ export const api = {
     }),
 
   submitAnswersUpload: (examId: string, formData: FormData) =>
-    apiFetch<Submission>(`/exams/${examId}/submit/upload`, {
+    apiFetch<Submission>(`/exams/${examId}/submit`, {
       method: "POST",
       body: formData,
     }),
+
+  submitBatch: (examId: string, file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return apiFetch<{ status: string; students_detected: number; total_pages: number }>(
+      `/exams/${examId}/submit/batch`, 
+      { method: "POST", body: formData }
+    );
+  },
 
   getSubmissions: (examId: string) =>
     apiFetch<SubmissionSummary[]>(`/exams/${examId}/submissions`),
@@ -155,6 +222,8 @@ export const api = {
     }),
 
   exportCsvUrl: (examId: string) => `${API_URL}/exams/${examId}/export/csv`,
+  exportCanvasUrl: (examId: string) => `${API_URL}/exams/${examId}/export/canvas`,
+  exportMoodleUrl: (examId: string) => `${API_URL}/exams/${examId}/export/moodle`,
 
   getStudentProgress: (name: string) =>
     apiFetch<StudentProgress>(`/students/${encodeURIComponent(name)}/progress`),

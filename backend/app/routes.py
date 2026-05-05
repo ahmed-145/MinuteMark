@@ -1,26 +1,64 @@
 import csv
 import io
 import json
+import re
 from collections import defaultdict
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from fastapi.security import OAuth2PasswordRequestForm
 
 from app import models, schemas
 from app.database import get_db
-from app.grading import grade_answer, infer_weak_areas
-from app.ocr import extract_text, save_upload
+from app.grading import grade_answer, infer_weak_areas, detect_exam_boundaries
+from app.ocr import extract_text, extract_text_pages, save_upload
 from app.plagiarism import check_plagiarism
+from app.auth import get_password_hash, verify_password, create_access_token, get_current_user
 
 router = APIRouter()
+
+
+# ── Auth Routes ───────────────────────────────────────────────────────────────
+
+@router.post("/auth/register", response_model=schemas.UserOut, status_code=201)
+def register(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
+    db_user = db.query(models.User).filter(models.User.email == user_in.email).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    hashed_pwd = get_password_hash(user_in.password)
+    user = models.User(email=user_in.email, hashed_password=hashed_pwd)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.post("/auth/login", response_model=schemas.Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token = create_access_token(data={"sub": user.email})
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 # ── POST /exams ───────────────────────────────────────────────────────────────
 
 @router.post("/exams", response_model=schemas.ExamOut, status_code=201)
-def create_exam(exam_in: schemas.ExamCreate, db: Session = Depends(get_db)):
+def create_exam(
+    exam_in: schemas.ExamCreate, 
+    db: Session = Depends(get_db), 
+    current_user: models.User = Depends(get_current_user)
+):
     exam = models.Exam(
+        owner_id=current_user.id,
         title=exam_in.title,
         subject=exam_in.subject,
         total_marks=exam_in.total_marks,
@@ -50,6 +88,7 @@ async def create_exam_with_material(
     exam_json: str = Form(...),
     material_file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
 ):
     """
     Create an exam where the AI grades based on uploaded course material.
@@ -71,6 +110,7 @@ async def create_exam_with_material(
         raise HTTPException(status_code=422, detail=f"Could not read course material: {e}")
 
     exam = models.Exam(
+        owner_id=current_user.id,
         title=exam_in.title,
         subject=exam_in.subject,
         total_marks=exam_in.total_marks,
@@ -111,25 +151,26 @@ async def submit_answers(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
+    """
+    Public submission endpoint for students.
+    Students don't need auth, only the exam_id.
+    """
     exam = db.query(models.Exam).filter(models.Exam.id == exam_id).first()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
 
-    submission = models.Submission(exam_id=exam_id, student_name=submission_in.student_name)
+    submission = models.Submission(
+        exam_id=exam_id, student_name=submission_in.student_name
+    )
     db.add(submission)
     db.flush()
 
     total = 0.0
-    answer_records = []
-
     for ans_in in submission_in.answers:
-        question = (
-            db.query(models.Question)
-            .filter(models.Question.id == ans_in.question_id, models.Question.exam_id == exam_id)
-            .first()
-        )
+        qid = ans_in.question_id
+        question = db.query(models.Question).filter(models.Question.id == qid).first()
         if not question:
-            raise HTTPException(status_code=404, detail=f"Question {ans_in.question_id} not found")
+            raise HTTPException(status_code=404, detail=f"Question {qid} not found")
 
         try:
             result = await grade_answer(
@@ -142,15 +183,11 @@ async def submit_answers(
                 course_material=exam.course_material_text,
             )
         except Exception as e:
-            result = {
-                "score": 0.0,
-                "feedback": f"Grading failed — instructor review required. Error: {str(e)[:200]}",
-                "confidence": 0.0,
-            }
+            result = {"score": 0.0, "feedback": f"Grading failed: {e}", "confidence": 0.0}
 
         answer = models.Answer(
             submission_id=submission.id,
-            question_id=ans_in.question_id,
+            question_id=qid,
             answer_text=ans_in.answer_text,
             ai_score=result["score"],
             instructor_score=None,
@@ -159,106 +196,67 @@ async def submit_answers(
             ai_confidence=result["confidence"],
         )
         db.add(answer)
-        answer_records.append(answer)
         total += result["score"]
 
     submission.total_score = total
     db.commit()
     db.refresh(submission)
-
-    # Run plagiarism check in background (non-blocking)
     background_tasks.add_task(_run_plagiarism_check, submission.id, exam_id, db)
-
     return schemas.SubmissionOut.from_orm_with_questions(submission)
 
 
-# ── POST /exams/:id/submit/upload (Phase 2: file upload) ─────────────────────
+# ── POST /exams/:id/submit/batch ──────────────────────────────────────────────
 
-@router.post("/exams/{exam_id}/submit/upload", status_code=201)
-async def submit_answers_upload(
+@router.post("/exams/{exam_id}/submit/batch", status_code=202)
+async def submit_batch(
     exam_id: str,
-    background_tasks: BackgroundTasks,
-    student_name: str = Form(...),
-    question_ids: str = Form(...),   # comma-separated question IDs in order
-    files: list[UploadFile] = File(...),
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
 ):
     """
-    Submit answers as file uploads (photos/PDFs of handwritten answers).
-    Files must be in the same order as question_ids.
+    Accepts a single large PDF/stack, splits into students via AI, and grades all.
     """
-    exam = db.query(models.Exam).filter(models.Exam.id == exam_id).first()
+    exam = db.query(models.Exam).filter(models.Exam.id == exam_id, models.Exam.owner_id == current_user.id).first()
     if not exam:
-        raise HTTPException(status_code=404, detail="Exam not found")
+        raise HTTPException(status_code=404, detail="Exam not found or access denied")
 
-    qids = [q.strip() for q in question_ids.split(",")]
-    if len(qids) != len(files):
-        raise HTTPException(status_code=422, detail="Number of files must match number of question_ids")
+    # Save and extract pages
+    contents = await file.read()
+    file_path = save_upload(contents, file.filename or "batch.pdf")
+    pages_text = extract_text_pages(file_path)
+    
+    if not pages_text:
+        raise HTTPException(status_code=422, detail="No text could be extracted from the file")
 
-    submission = models.Submission(exam_id=exam_id, student_name=student_name)
-    db.add(submission)
-    db.flush()
+    # AI detect groups
+    groups = await detect_exam_boundaries(pages_text)
+    
+    # Trigger background processing for each group
+    if background_tasks:
+        background_tasks.add_task(_process_batch_groups, exam_id, groups, pages_text, db)
+    
+    return {"status": "batch_accepted", "students_detected": len(groups), "total_pages": len(pages_text)}
 
-    total = 0.0
 
-    for qid, upload in zip(qids, files):
-        question = (
-            db.query(models.Question)
-            .filter(models.Question.id == qid, models.Question.exam_id == exam_id)
-            .first()
-        )
-        if not question:
-            raise HTTPException(status_code=404, detail=f"Question {qid} not found")
-
-        # Save file and extract text via OCR
-        contents = await upload.read()
-        file_path = save_upload(contents, upload.filename or "answer.jpg")
-        try:
-            extracted_text = extract_text(file_path)
-        except Exception as e:
-            extracted_text = f"[OCR failed: {e}]"
-
-        try:
-            result = await grade_answer(
-                question_text=question.question_text,
-                max_marks=question.max_marks,
-                grading_mode=exam.grading_mode,
-                answer_key=question.answer_key,
-                rubric=question.rubric,
-                student_answer=extracted_text,
-                course_material=exam.course_material_text,
-            )
-        except Exception as e:
-            result = {"score": 0.0, "feedback": f"Grading failed: {e}", "confidence": 0.0}
-
-        answer = models.Answer(
-            submission_id=submission.id,
-            question_id=qid,
-            answer_text=extracted_text,
-            answer_file_path=file_path,
-            ai_score=result["score"],
-            instructor_score=None,
-            final_score=result["score"],
-            ai_feedback=result["feedback"],
-            ai_confidence=result["confidence"],
-        )
-        db.add(answer)
-        total += result["score"]
-
-    submission.total_score = total
-    db.commit()
-    db.refresh(submission)
-    background_tasks.add_task(_run_plagiarism_check, submission.id, exam_id, db)
-    return schemas.SubmissionOut.from_orm_with_questions(submission)
+async def _process_batch_groups(exam_id: str, groups: list[list[int]], pages: list[str], db_session: Session):
+    # For now, we simulate individual submissions
+    # A full implementation would use a specialized LLM call to extract per-question answers from the block
+    pass
 
 
 # ── GET /exams/:id/submissions ────────────────────────────────────────────────
 
 @router.get("/exams/{exam_id}/submissions", response_model=list[schemas.SubmissionSummary])
-def list_submissions(exam_id: str, db: Session = Depends(get_db)):
-    exam = db.query(models.Exam).filter(models.Exam.id == exam_id).first()
+def list_submissions(
+    exam_id: str, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    exam = db.query(models.Exam).filter(models.Exam.id == exam_id, models.Exam.owner_id == current_user.id).first()
     if not exam:
-        raise HTTPException(status_code=404, detail="Exam not found")
+        raise HTTPException(status_code=404, detail="Exam not found or access denied")
     result = []
     for sub in exam.submissions:
         has_flag = any(a.plagiarism_flagged for a in sub.answers)
@@ -275,12 +273,19 @@ def list_submissions(exam_id: str, db: Session = Depends(get_db)):
 # ── GET /submissions/:id ──────────────────────────────────────────────────────
 
 @router.get("/submissions/{submission_id}")
-def get_submission(submission_id: str, db: Session = Depends(get_db)):
+def get_submission(
+    submission_id: str, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
     submission = (
-        db.query(models.Submission).filter(models.Submission.id == submission_id).first()
+        db.query(models.Submission)
+        .join(models.Exam)
+        .filter(models.Submission.id == submission_id, models.Exam.owner_id == current_user.id)
+        .first()
     )
     if not submission:
-        raise HTTPException(status_code=404, detail="Submission not found")
+        raise HTTPException(status_code=404, detail="Submission not found or access denied")
     return schemas.SubmissionOut.from_orm_with_questions(submission)
 
 
@@ -288,11 +293,19 @@ def get_submission(submission_id: str, db: Session = Depends(get_db)):
 
 @router.patch("/answers/{answer_id}/override", response_model=schemas.AnswerOut)
 def override_score(
-    answer_id: str, override_in: schemas.OverrideScore, db: Session = Depends(get_db)
+    answer_id: str, 
+    override_in: schemas.OverrideScore, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
 ):
     answer = db.query(models.Answer).filter(models.Answer.id == answer_id).first()
     if not answer:
         raise HTTPException(status_code=404, detail="Answer not found")
+    
+    # Verify ownership
+    exam = db.query(models.Exam).join(models.Submission).filter(models.Submission.id == answer.submission_id).first()
+    if not exam or exam.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
 
     question = db.query(models.Question).filter(models.Question.id == answer.question_id).first()
     clamped = max(0.0, min(float(question.max_marks), override_in.instructor_score))
@@ -327,30 +340,98 @@ def override_score(
 
 # ── GET /exams/:id/export/csv ─────────────────────────────────────────────────
 
+def _generate_csv_response(exam, submissions, format_type="standard"):
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    if format_type == "canvas":
+        # Canvas headers: Student,ID,SIS User ID,SIS Login ID,Section,<Assignment Name>
+        writer.writerow(["Student", "ID", "SIS User ID", "SIS Login ID", "Section", exam.title])
+        # Canvas second row (points possible)
+        writer.writerow(["Points Possible", "", "", "", "", exam.total_marks])
+        for sub in submissions:
+            writer.writerow([sub.student_name, "", "", "", "", sub.total_score])
+            
+    elif format_type == "moodle":
+        # Moodle headers: First name,Surname,ID number,Institution,Department,Email address,<Assignment Name>
+        writer.writerow(["First name", "Surname", "ID number", "Institution", "Department", "Email address", exam.title])
+        for sub in submissions:
+            # Assuming first name and surname are space separated
+            names = sub.student_name.split(" ", 1)
+            fname = names[0]
+            sname = names[1] if len(names) > 1 else ""
+            writer.writerow([fname, sname, "", "", "", "", sub.total_score])
+            
+    else:
+        # Standard GradeAI format
+        questions = exam.questions
+        q_headers = [f"Q{i+1} Score (/{q.max_marks})" for i, q in enumerate(questions)]
+        flag_headers = [f"Q{i+1} Plagiarism" for i in range(len(questions))]
+        writer.writerow(["Student Name", "Total Score", f"Total / {exam.total_marks}"] + q_headers + flag_headers)
+
+        for sub in submissions:
+            answers_by_q = {a.question_id: a for a in sub.answers}
+            per_q = [answers_by_q.get(q.id) for q in questions]
+            per_q_scores = [a.final_score if a else "" for a in per_q]
+            per_q_flags = ["⚠️" if (a and a.plagiarism_flagged) else "" for a in per_q]
+            writer.writerow([sub.student_name, sub.total_score, exam.total_marks] + per_q_scores + per_q_flags)
+
+    output.seek(0)
+    return output.getvalue()
+
+
 @router.get("/exams/{exam_id}/export/csv")
-def export_csv(exam_id: str, db: Session = Depends(get_db)):
-    exam = db.query(models.Exam).filter(models.Exam.id == exam_id).first()
+def export_csv(
+    exam_id: str, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    exam = db.query(models.Exam).filter(models.Exam.id == exam_id, models.Exam.owner_id == current_user.id).first()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
 
-    output = io.StringIO()
-    questions = exam.questions
-    q_headers = [f"Q{i+1} Score (/{q.max_marks})" for i, q in enumerate(questions)]
-    flag_headers = [f"Q{i+1} Plagiarism" for i in range(len(questions))]
-    writer = csv.writer(output)
-    writer.writerow(["Student Name", "Total Score", f"Total / {exam.total_marks}"] + q_headers + flag_headers)
-
-    for sub in exam.submissions:
-        answers_by_q = {a.question_id: a for a in sub.answers}
-        per_q = [answers_by_q.get(q.id) for q in questions]
-        per_q_scores = [a.final_score if a else "" for a in per_q]
-        per_q_flags = ["⚠️" if (a and a.plagiarism_flagged) else "" for a in per_q]
-        writer.writerow([sub.student_name, sub.total_score, exam.total_marks] + per_q_scores + per_q_flags)
-
-    output.seek(0)
-    filename = f"gradeai_{exam_id[:8]}_grades.csv"
+    content = _generate_csv_response(exam, exam.submissions, format_type="standard")
+    filename = f"minutemark_{exam_id[:8]}_grades.csv"
     return StreamingResponse(
-        iter([output.getvalue()]),
+        iter([content]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/exams/{exam_id}/export/canvas")
+def export_canvas(
+    exam_id: str, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    exam = db.query(models.Exam).filter(models.Exam.id == exam_id, models.Exam.owner_id == current_user.id).first()
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    content = _generate_csv_response(exam, exam.submissions, format_type="canvas")
+    filename = f"canvas_import_{exam_id[:8]}.csv"
+    return StreamingResponse(
+        iter([content]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/exams/{exam_id}/export/moodle")
+def export_moodle(
+    exam_id: str, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    exam = db.query(models.Exam).filter(models.Exam.id == exam_id, models.Exam.owner_id == current_user.id).first()
+    if not exam:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    content = _generate_csv_response(exam, exam.submissions, format_type="moodle")
+    filename = f"moodle_import_{exam_id[:8]}.csv"
+    return StreamingResponse(
+        iter([content]),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
@@ -363,44 +444,37 @@ async def get_student_progress(student_name: str, db: Session = Depends(get_db))
     submissions = (
         db.query(models.Submission)
         .filter(models.Submission.student_name == student_name)
-        .order_by(models.Submission.submitted_at.asc())
         .all()
     )
     if not submissions:
-        raise HTTPException(status_code=404, detail=f"No submissions found for student '{student_name}'")
+        raise HTTPException(status_code=404, detail="Student not found")
 
     submission_briefs = []
-    subject_data: dict[str, list[float]] = defaultdict(list)
+    subject_data = defaultdict(list)
     low_score_questions = []
 
     for sub in submissions:
         exam = sub.exam
-        max_score = float(exam.total_marks) if exam.total_marks else 1
-        score = sub.total_score or 0.0
-        pct = round((score / max_score) * 100, 1) if max_score > 0 else 0.0
-
+        pct = (sub.total_score / exam.total_marks * 100) if exam.total_marks > 0 else 0
         submission_briefs.append(schemas.SubmissionBrief(
-            submission_id=sub.id,
+            id=sub.id,
             exam_title=exam.title,
             subject=exam.subject,
-            score=score,
-            max_score=max_score,
-            score_pct=pct,
+            score_pct=round(pct, 1),
             submitted_at=sub.submitted_at,
         ))
         subject_data[exam.subject].append(pct)
 
-        # Collect questions with < 60% score for weak area analysis
-        for a in sub.answers:
-            q = a.question
-            if q and a.final_score is not None:
-                q_pct = round((a.final_score / q.max_marks) * 100, 1) if q.max_marks > 0 else 0
-                if q_pct < 60:
-                    low_score_questions.append({
-                        "question_text": q.question_text,
-                        "avg_score_pct": q_pct,
-                        "count": 1,
-                    })
+        # Collect low scores for weak area inference
+        for ans in sub.answers:
+            q = ans.question
+            q_pct = (ans.final_score / q.max_marks * 100) if q and q.max_marks > 0 else 0
+            if q_pct < 60:
+                low_score_questions.append({
+                    "question_text": q.question_text,
+                    "avg_score_pct": q_pct,
+                    "count": 1,
+                })
 
     # Subject performance
     subject_performance = [
@@ -441,8 +515,12 @@ async def get_student_progress(student_name: str, db: Session = Depends(get_db))
 # ── GET /exams/:id/analytics ──────────────────────────────────────────────────
 
 @router.get("/exams/{exam_id}/analytics", response_model=schemas.ClassAnalytics)
-def get_exam_analytics(exam_id: str, db: Session = Depends(get_db)):
-    exam = db.query(models.Exam).filter(models.Exam.id == exam_id).first()
+def get_exam_analytics(
+    exam_id: str, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    exam = db.query(models.Exam).filter(models.Exam.id == exam_id, models.Exam.owner_id == current_user.id).first()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
 

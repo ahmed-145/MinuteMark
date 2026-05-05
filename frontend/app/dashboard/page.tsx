@@ -6,6 +6,7 @@ import { api, Exam, SubmissionSummary, ClassAnalytics } from "@/lib/api";
 import Link from "next/link";
 
 function DashboardContent() {
+  const router = useRouter();
   const searchParams = useSearchParams();
   const [examId, setExamId] = useState(searchParams.get("examId") || "");
   const [inputId, setInputId] = useState(searchParams.get("examId") || "");
@@ -14,6 +15,8 @@ function DashboardContent() {
   const [analytics, setAnalytics] = useState<ClassAnalytics | null>(null);
   const [view, setView] = useState<"submissions" | "analytics">("submissions");
   const [loading, setLoading] = useState(false);
+  const [batchLoading, setBatchLoading] = useState(false);
+  const [batchMessage, setBatchMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
@@ -38,8 +41,13 @@ function DashboardContent() {
   }, []);
 
   useEffect(() => {
+    const token = typeof window !== "undefined" ? localStorage.getItem("token") : null;
+    if (!token) {
+      router.push("/login");
+      return;
+    }
     if (examId) load(examId);
-  }, [examId, load]);
+  }, [examId, load, router]);
 
   const copyLink = () => {
     if (!exam) return;
@@ -47,6 +55,22 @@ function DashboardContent() {
     navigator.clipboard.writeText(url);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleBatchUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!exam || !e.target.files?.[0]) return;
+    const file = e.target.files[0];
+    setBatchLoading(true);
+    setBatchMessage(null);
+    try {
+      const res = await api.submitBatch(exam.id, file);
+      setBatchMessage(`Accepted: detected ${res.students_detected} students. Grading started!`);
+      setTimeout(() => load(exam.id), 5000);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Batch upload failed");
+    } finally {
+      setBatchLoading(false);
+    }
   };
 
   const avg =
@@ -59,7 +83,7 @@ function DashboardContent() {
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 py-12">
       <div className="mb-8">
-        <h1 className="page-header">Instructor Dashboard</h1>
+        <h1 className="page-header">MinuteMark Dashboard</h1>
         <p className="page-sub">View submissions, check grades, export results.</p>
       </div>
 
@@ -117,13 +141,24 @@ function DashboardContent() {
                 <button onClick={copyLink} className="btn-secondary text-sm">
                   {copied ? "✓ Copied!" : "📋 Copy Student Link"}
                 </button>
-                <a
-                  href={api.exportCsvUrl(exam.id)}
-                  className="btn-primary text-sm"
-                  download
-                >
-                  ↓ Export CSV
-                </a>
+                
+                <label className={`btn-secondary text-sm cursor-pointer ${batchLoading ? 'opacity-50 pointer-events-none' : ''}`}>
+                  {batchLoading ? "⌛ Processing Batch..." : "📦 Batch PDF Upload"}
+                  <input type="file" className="hidden" accept=".pdf" onChange={handleBatchUpload} />
+                </label>
+
+                <div className="relative group">
+                  <button className="btn-primary text-sm flex items-center gap-2">
+                    ↓ Export Grades
+                    <span className="text-[10px]">▼</span>
+                  </button>
+                  <div className="absolute right-0 top-full mt-1 w-48 bg-slate-800 border border-white/10 rounded-lg shadow-xl hidden group-hover:block z-20 overflow-hidden">
+                    <a href={api.exportCsvUrl(exam.id)} className="block px-4 py-2.5 text-xs text-slate-300 hover:bg-brand-600 hover:text-white transition-colors" download>Standard CSV</a>
+                    <a href={api.exportCanvasUrl(exam.id)} className="block px-4 py-2.5 text-xs text-slate-300 hover:bg-brand-600 hover:text-white transition-colors" download>Canvas Import</a>
+                    <a href={api.exportMoodleUrl(exam.id)} className="block px-4 py-2.5 text-xs text-slate-300 hover:bg-brand-600 hover:text-white transition-colors" download>Moodle Import</a>
+                  </div>
+                </div>
+
                 <button
                   onClick={() => { setExam(null); setSubmissions([]); setExamId(""); setInputId(""); }}
                   className="btn-secondary text-sm"
@@ -133,6 +168,16 @@ function DashboardContent() {
               </div>
             </div>
           </div>
+
+          {/* Toast Notification for Batch */}
+          {batchMessage && (
+            <div className="fixed bottom-8 right-8 max-w-sm bg-brand-600 text-white p-4 rounded-xl shadow-2xl z-50 animate-in slide-in-from-bottom-4">
+              <div className="flex justify-between items-start gap-4">
+                <p className="text-sm font-medium">{batchMessage}</p>
+                <button onClick={() => setBatchMessage(null)} className="text-white/50 hover:text-white">✕</button>
+              </div>
+            </div>
+          )}
 
           {/* Stats */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">

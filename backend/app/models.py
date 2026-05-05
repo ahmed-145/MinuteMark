@@ -11,10 +11,22 @@ def gen_uuid():
     return str(uuid.uuid4())
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(String(36), primary_key=True, default=gen_uuid)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    exams = relationship("Exam", back_populates="owner")
+
+
 class Exam(Base):
     __tablename__ = "exams"
 
     id = Column(String(36), primary_key=True, default=gen_uuid)
+    owner_id = Column(String(36), ForeignKey("users.id"), nullable=True) # Nullable for now to support old data
     title = Column(Text, nullable=False)
     subject = Column(Text, nullable=False)
     total_marks = Column(Integer, nullable=False)
@@ -22,6 +34,7 @@ class Exam(Base):
     course_material_text = Column(Text, nullable=True)  # Phase 2: uploaded course doc text
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    owner = relationship("User", back_populates="exams")
     questions = relationship("Question", back_populates="exam", order_by="Question.order_index")
     submissions = relationship("Submission", back_populates="exam")
 

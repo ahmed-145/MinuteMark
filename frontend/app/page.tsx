@@ -16,14 +16,14 @@ export default function HomePage() {
           Not 3 weeks.
         </h1>
         <p className="text-xl text-slate-300 max-w-2xl mx-auto leading-relaxed">
-          GradeAI grades every exam submission with detailed, teacher-quality written feedback — per question, instantly, at scale.
+          MinuteMark grades every exam submission with detailed, teacher-quality written feedback — per question, instantly, at scale.
         </p>
         <div className="flex items-center justify-center gap-4 mt-10">
-          <a href="/create" className="btn-primary px-8 py-4 text-base">
-            Create an Exam →
+          <a href="/register" className="btn-primary px-8 py-4 text-base">
+            Start Free Trial →
           </a>
-          <a href="/dashboard" className="btn-secondary px-8 py-4 text-base">
-            Instructor Dashboard
+          <a href="/login" className="btn-secondary px-8 py-4 text-base">
+            Login
           </a>
         </div>
       </div>

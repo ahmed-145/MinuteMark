@@ -204,3 +204,24 @@ class ClassAnalytics(BaseModel):
     average_pct: float
     score_distribution: dict[str, int]
     question_breakdown: list[QuestionAnalytics]
+
+
+# ── Auth schemas ──────────────────────────────────────────────────────────────
+
+class UserCreate(BaseModel):
+    email: str
+    password: str
+
+
+class UserOut(BaseModel):
+    id: str
+    email: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
