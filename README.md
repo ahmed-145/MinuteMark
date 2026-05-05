@@ -28,7 +28,7 @@ graph TD
 
 ---
 
-## 🚀 "God Mode" Features
+## 🚀 Features
 
 ### 📦 AI-Powered Batch Processing
 Stop uploading files one by one. Scan your entire class stack into a single PDF.
